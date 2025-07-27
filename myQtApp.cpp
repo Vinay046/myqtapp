@@ -5,6 +5,6 @@ int main(int argc, char *argv[]) {
     QApplication app(argc, argv);
     QPushButton button("Hello, Qt6 on Wayland!");
     button.resize(300, 100);
-    button.show();
+    button.showFullScreen();
     return app.exec();
 }
