@@ -1,18 +1,29 @@
 #include <QApplication>
-#include <QMainWindow>
-#include <QPushButton>
+#include <QLabel>
+#include <QFont>
 
-int main(int argc, char *argv[]) {
+int main(int argc, char *argv[])
+{
     QApplication app(argc, argv);
-
-    QMainWindow window;
-    QPushButton *button = new QPushButton("Hello, Qt6 on Wayland!", &window);
-    button->setGeometry(10, 10, 300, 100);  // Optional
-
-    window.setCentralWidget(button);
-    window.setWindowFlags(Qt::FramelessWindowHint);  // Optional: removes title bar
-    window.showFullScreen();
-
+    
+    QLabel label("Hello Qt6!");
+    
+    // Remove window decorations (title bar, buttons, etc.)
+    label.setWindowFlags(Qt::Window | Qt::FramelessWindowHint);
+    
+    // Set font size and alignment
+    QFont font = label.font();
+    font.setPointSize(48);
+    font.setBold(true);
+    label.setFont(font);
+    label.setAlignment(Qt::AlignCenter);
+    
+    // Set background color and size
+    label.setStyleSheet("QLabel { background-color: #2c3e50; color: #ecf0f1; }");
+    label.resize(800, 600);
+    
+    // Show the window
+    label.show();
+    
     return app.exec();
 }
-
