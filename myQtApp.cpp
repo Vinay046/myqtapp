@@ -58,6 +58,10 @@
 #include <QFontDatabase>
 #include <QSocketNotifier>
 #include <QDebug>
+#include <QPropertyAnimation>
+#include <QParallelAnimationGroup>
+#include <QGraphicsOpacityEffect>
+#include <QEasingCurve>
 #include <functional>
 #include <cmath>
 
@@ -745,6 +749,14 @@ class MainWindow : public QWidget
     SidebarOverlay  *m_sidebar   = nullptr;
     DetailOverlay   *m_detail    = nullptr;
 
+    QGraphicsOpacityEffect *m_sidebarOpacity = nullptr;
+    QPropertyAnimation     *m_sidebarSlide   = nullptr;
+    QPropertyAnimation     *m_sidebarFade    = nullptr;
+    QParallelAnimationGroup *m_sidebarAnim   = nullptr;
+
+    bool m_switchingCategory = false;
+    bool m_sidebarClosing = false;
+
 public:
     explicit MainWindow(QWidget *parent = nullptr) : QWidget(parent)
     {
@@ -755,6 +767,26 @@ public:
         // Create overlays first (resizeEvent may fire during buildShell)
         m_sidebar = new SidebarOverlay(this);
         m_sidebar->hide();
+        m_sidebarOpacity = new QGraphicsOpacityEffect(m_sidebar);
+        m_sidebarOpacity->setOpacity(1.0);
+        m_sidebar->setGraphicsEffect(m_sidebarOpacity);
+
+        m_sidebarSlide = new QPropertyAnimation(m_sidebar, "pos", this);
+        m_sidebarFade  = new QPropertyAnimation(m_sidebarOpacity, "opacity", this);
+        m_sidebarAnim  = new QParallelAnimationGroup(this);
+        m_sidebarAnim->addAnimation(m_sidebarSlide);
+        m_sidebarAnim->addAnimation(m_sidebarFade);
+        QObject::connect(m_sidebarAnim, &QParallelAnimationGroup::finished,
+                         this, [this]() {
+            if (m_sidebarClosing) {
+                m_sidebarClosing = false;
+                if (m_state == AppState::Sidebar) {
+                    m_state = AppState::Browse;
+                    m_sidebar->hide();
+                    restoreFocus();
+                }
+            }
+        });
         m_sidebar->setSelectCb([this](Category c){ switchCategory(c); });
         m_sidebar->setCloseCb ([this](){ closeSidebar(); });
 
@@ -777,17 +809,52 @@ public:
     // ── Overlay lifecycle ─────────────────────────────────────────────────
     void openSidebar()
     {
-        if (m_state != AppState::Browse) return;
+        if (m_state != AppState::Browse || m_switchingCategory) return;
         m_state = AppState::Sidebar;
         m_sidebar->setActiveCategory(m_category);
-        m_sidebar->show(); m_sidebar->raise();
+
+        if (m_sidebarAnim->state() == QAbstractAnimation::Running)
+            m_sidebarAnim->stop();
+
+        const int y = 0;
+        m_sidebar->move(-m_sidebar->width(), y);
+        m_sidebarOpacity->setOpacity(0.0);
+        m_sidebar->show();
+        m_sidebar->raise();
+
+        m_sidebarSlide->setDuration(220);
+        m_sidebarSlide->setEasingCurve(QEasingCurve::OutCubic);
+        m_sidebarSlide->setStartValue(QPoint(-m_sidebar->width(), y));
+        m_sidebarSlide->setEndValue(QPoint(0, y));
+
+        m_sidebarFade->setDuration(220);
+        m_sidebarFade->setEasingCurve(QEasingCurve::OutCubic);
+        m_sidebarFade->setStartValue(0.0);
+        m_sidebarFade->setEndValue(1.0);
+
+        m_sidebarAnim->start();
     }
 
     void closeSidebar()
     {
-        m_state = AppState::Browse;
-        m_sidebar->hide();
-        restoreFocus();
+        if (m_state != AppState::Sidebar) return;
+
+        if (m_sidebarAnim->state() == QAbstractAnimation::Running)
+            m_sidebarAnim->stop();
+
+        const int y = 0;
+        m_sidebarSlide->setDuration(180);
+        m_sidebarSlide->setEasingCurve(QEasingCurve::InCubic);
+        m_sidebarSlide->setStartValue(m_sidebar->pos());
+        m_sidebarSlide->setEndValue(QPoint(-m_sidebar->width(), y));
+
+        m_sidebarFade->setDuration(180);
+        m_sidebarFade->setEasingCurve(QEasingCurve::InCubic);
+        m_sidebarFade->setStartValue(m_sidebarOpacity->opacity());
+        m_sidebarFade->setEndValue(0.0);
+
+        m_sidebarClosing = true;
+        m_sidebarAnim->start();
     }
 
     void openDetail(const ContentItem &item)
@@ -963,6 +1030,9 @@ private:
     // ── Rebuild content rows for the chosen category ──────────────────────
     void switchCategory(Category cat)
     {
+        if (m_switchingCategory) return;
+        m_switchingCategory = true;
+
         m_category = cat;
         m_rows.clear();
         m_r = 0; m_c = 0;
@@ -982,14 +1052,58 @@ private:
         }
         vl->addStretch();
 
-        // Replacing the widget also deletes the old one (and its children).
+        QWidget *oldContent = m_vScroll->widget();
+        if (oldContent) {
+            auto *oldFx = new QGraphicsOpacityEffect(oldContent);
+            oldContent->setGraphicsEffect(oldFx);
+            auto *oldFade = new QPropertyAnimation(oldFx, "opacity", oldContent);
+            oldFade->setDuration(150);
+            oldFade->setEasingCurve(QEasingCurve::InOutQuad);
+            oldFade->setStartValue(1.0);
+            oldFade->setEndValue(0.0);
+            QObject::connect(oldFade, &QPropertyAnimation::finished,
+                             oldContent, &QWidget::deleteLater);
+            oldFade->start(QAbstractAnimation::DeleteWhenStopped);
+        }
+
+        m_vScroll->takeWidget();
         m_vScroll->setWidget(vc);
 
-        // Close sidebar and reset state
-        m_state = AppState::Browse;
+        auto *fx = new QGraphicsOpacityEffect(vc);
+        vc->setGraphicsEffect(fx);
+        fx->setOpacity(0.0);
+        vc->move(36, 0);
+
+        auto *slide = new QPropertyAnimation(vc, "pos", vc);
+        slide->setDuration(230);
+        slide->setEasingCurve(QEasingCurve::OutCubic);
+        slide->setStartValue(QPoint(36, 0));
+        slide->setEndValue(QPoint(0, 0));
+
+        auto *fade = new QPropertyAnimation(fx, "opacity", vc);
+        fade->setDuration(230);
+        fade->setEasingCurve(QEasingCurve::OutCubic);
+        fade->setStartValue(0.0);
+        fade->setEndValue(1.0);
+
+        auto *group = new QParallelAnimationGroup(vc);
+        group->addAnimation(slide);
+        group->addAnimation(fade);
+
+        QObject::connect(group, &QParallelAnimationGroup::finished, this, [this, vc]() {
+            vc->move(0, 0);
+            vc->setGraphicsEffect(nullptr);
+            setInitialFocus();
+            m_switchingCategory = false;
+            m_state = AppState::Browse;
+            m_sidebar->hide();
+        });
+
+        if (m_sidebarAnim->state() == QAbstractAnimation::Running)
+            m_sidebarAnim->stop();
         m_sidebar->hide();
 
-        setInitialFocus();
+        group->start(QAbstractAnimation::DeleteWhenStopped);
     }
 
     // ── Content builders ──────────────────────────────────────────────────
