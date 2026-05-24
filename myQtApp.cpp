@@ -682,7 +682,7 @@ protected:
         p.setPen(TV::TEXT_PRI);
         p.drawText(QRect(int(av.right())+14, 48,
                          width()-int(av.right())-18, 26),
-                   Qt::AlignLeft|Qt::AlignVCenter, "Ashley Miller");
+                   Qt::AlignLeft|Qt::AlignVCenter, "Vinay Patil");
 
         p.setFont(QFont("Roboto", 12));
         p.setPen(TV::TEXT_SEC);
