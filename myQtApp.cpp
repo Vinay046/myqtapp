@@ -1,39 +1,40 @@
 /*
- * myQtApp.cpp  –  Android TV Browse UI  v2
+ * myQtApp.cpp  –  Android TV Browse UI  v3
  *
- * What's new in v2:
- *  1. Left sidebar overlay (BTN_START / Qt::Key_Home)
- *       - Categories: Search, Movies, Series, Music
- *       - D-pad navigates items; Enter selects; Left/Esc dismisses
- *       - User avatar, "Settings" gutter entry, active-item pill highlight
- *  2. Detail overlay (Movies & Series)
- *       - Full-screen dim + centred rounded card (image, title, meta, desc)
- *       - Two D-pad-navigable buttons: Play and Add to Favorites
- *       - Click outside card to dismiss
- *  3. Music cards
- *       - Square (220×220) album-art tiles
- *       - Focused state shows a white-circle play-button overlay + glow border
- *       - Enter / A-button plays the file directly (no detail overlay)
- *  4. Unified AppState machine routes every key press from DpadFilter
- *       Browse → Sidebar → Detail transitions are clean and reversible
+ * What's new in v3:
+ *  1. Home page  (default landing screen)
+ *       - Full-width Hero card (featured item) with gradient overlay,
+ *         title, description and "Enter to Play" hint
+ *       - "Frequently Played" and "Recently Watched" horizontal rows
+ *       - Sidebar now includes a "Home" entry at the top
+ *  2. B button / Key_Back / Key_Escape no longer closes the app
+ *       - In Browse mode on any non-Home page  → navigate back to Home
+ *       - In Browse mode already on Home       → no-op (app stays open)
+ *       - In Detail overlay                    → dismiss overlay, stay on page
+ *       - In Sidebar                           → close sidebar
+ *       - App can only be terminated by the OS / system integrator
+ *  3. App launches directly to Home (Category::Home)
+ *  4. Xbox controller auto-detection via EVIOCGNAME ioctl
+ *       (see v2 notes – unchanged)
  *
  * Controller mapping (evdev / xpad kernel module):
- *  BTN_START (code 314)  → open / close sidebar  (also Qt::Key_Home)
+ *  BTN_START (code 314)  → open / close sidebar   (also Qt::Key_Home)
  *  ABS_HAT0X -1/+1       → left / right
  *  ABS_HAT0Y -1/+1       → up / down
  *  BTN_SOUTH (A button)  → confirm / play
- *  BTN_EAST  (B button)  → back / dismiss
+ *  BTN_EAST  (B button)  → back to Home  (never closes app)
  *
  * Cross-compile / Bitbake notes:
- *  - QT += widgets          (no extra modules)
+ *  - QT += widgets
  *  - CONFIG += c++11
  *  - RESOURCES += fonts.qrc
- *  - linux/input.h          from linux-libc-headers in any Yocto sysroot
- *  - <cmath>                standard C++11 (used for gear icon only)
- *  - No Q_OBJECT macro on custom classes → no per-class moc step
- *    (std::function<> callbacks replace signals/slots throughout)
- *  - GamepadReader uses QSocketNotifier (unchanged from v1)
- *  - /dev/input/eventN must be readable; see udev notes in v1
+ *  - linux/input.h + sys/ioctl.h  from linux-libc-headers in any Yocto sysroot
+ *  - No extra LIBS or INCLUDEPATH needed
+ *  - No Q_OBJECT on custom classes (std::function replaces signals/slots)
+ *    except GamepadReader which retains Q_OBJECT for QSocketNotifier slot
+ *
+ * Udev rule for non-root access (add to /etc/udev/rules.d/99-gamepad.rules):
+ *   SUBSYSTEM=="input", ATTRS{name}=="*Xbox*", MODE="0660", GROUP="input"
  */
 
 #include <QApplication>
@@ -62,14 +63,56 @@
 #include <QParallelAnimationGroup>
 #include <QGraphicsOpacityEffect>
 #include <QEasingCurve>
+#include <QDir>
+#include <QStringList>
 #include <functional>
 #include <cmath>
 
 #include <linux/input.h>
+#include <sys/ioctl.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <cerrno>
 #include <cstring>
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Xbox controller auto-detection
+//
+//  Scans every /dev/input/event* node and returns the path of the first one
+//  whose EVIOCGNAME string contains "Xbox" (case-insensitive).
+//  Returns an empty QString if no matching device is found.
+// ─────────────────────────────────────────────────────────────────────────────
+static QString findXboxEventDevice()
+{
+    QDir inputDir("/dev/input");
+    QStringList nodes = inputDir.entryList(
+        QStringList() << "event*",
+        QDir::System,
+        QDir::Name
+    );
+
+    for (const QString &node : nodes) {
+        QString path = "/dev/input/" + node;
+        int fd = ::open(path.toLocal8Bit().constData(), O_RDONLY | O_NONBLOCK);
+        if (fd < 0) continue;
+
+        char buf[256] = {};
+        int rc = ::ioctl(fd, EVIOCGNAME(sizeof(buf) - 1), buf);
+        ::close(fd);
+        if (rc < 0) continue;
+
+        QString name = QString::fromLocal8Bit(buf);
+        qDebug() << " " << path << "→" << name;
+
+        if (name.contains("Xbox", Qt::CaseInsensitive)) {
+            qDebug() << "GamepadReader: selected" << path << "(" << name << ")";
+            return path;
+        }
+    }
+
+    qWarning() << "GamepadReader: no Xbox device found under /dev/input/";
+    return QString();
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Design tokens  (1920×1080)
@@ -85,20 +128,26 @@ namespace TV {
     const int MARGIN_V  =  54;
 
     const int CARD_W    = 380;
-    const int CARD_H    = 213;  // 16:9
+    const int CARD_H    = 213;   // 16:9
     const int CARD_R    =  10;
     const int GUTTER    =  20;
     const int ROW_GAP   =  40;
 
-    const int MUSIC_SZ  = 220;  // square music tile
+    const int MUSIC_SZ  = 220;   // square music tile
     const int SIDEBAR_W = 380;
+
+    const int HERO_H    = 420;   // home-page hero banner height
+    const int HERO_R    =  14;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Enums & data structs
 // ─────────────────────────────────────────────────────────────────────────────
 enum class AppState { Browse, Sidebar, Detail };
-enum class Category { Search, Movies, Series, Music };
+
+// Home is the first entry – app launches here; B always returns here.
+enum class Category { Home, Search, Movies, Series, Music };
+
 enum class CardKind  { Movie, Series, Music };
 
 struct ContentItem {
@@ -111,14 +160,37 @@ struct ContentItem {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Icon painters  (each saves/restores painter state)
+//  Icon painters
 // ─────────────────────────────────────────────────────────────────────────────
+static void drawHomeIcon(QPainter &p, QRectF r, QColor c)
+{
+    p.save();
+    p.setPen(QPen(c, 2.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+    p.setBrush(Qt::NoBrush);
+    // Roof triangle
+    qreal mx = r.center().x();
+    QPolygonF roof;
+    roof << QPointF(mx, r.top()+2)
+         << QPointF(r.right()-1, r.top()+r.height()*.44)
+         << QPointF(r.left()+1,  r.top()+r.height()*.44);
+    p.drawPolyline(roof);
+    // House body
+    QRectF body(r.left()+r.width()*.15, r.top()+r.height()*.42,
+                r.width()*.70, r.height()*.54);
+    p.drawRect(body);
+    // Door
+    QRectF door(mx-r.width()*.12, body.bottom()-r.height()*.28,
+                r.width()*.24, r.height()*.28);
+    p.drawRect(door);
+    p.restore();
+}
+
 static void drawSearchIcon(QPainter &p, QRectF r, QColor c)
 {
     p.save();
     p.setPen(QPen(c, 2.2, Qt::SolidLine, Qt::RoundCap));
     p.setBrush(Qt::NoBrush);
-    qreal cx = r.left() + r.width()*.40,  cy = r.top() + r.height()*.40;
+    qreal cx = r.left()+r.width()*.40, cy = r.top()+r.height()*.40;
     qreal cr = r.width()*.30;
     p.drawEllipse(QPointF(cx,cy), cr, cr);
     qreal s = cr*.707;
@@ -151,9 +223,9 @@ static void drawSeriesIcon(QPainter &p, QRectF r, QColor c)
     QRectF screen(r.left(), r.top(), r.width(), r.height()*.74);
     p.drawRoundedRect(screen, 3, 3);
     qreal mx = r.center().x();
-    p.drawLine(QPointF(mx, screen.bottom()), QPointF(mx, r.bottom()));
-    p.drawLine(QPointF(mx-r.width()*.25, r.bottom()),
-               QPointF(mx+r.width()*.25, r.bottom()));
+    p.drawLine(QPointF(mx,screen.bottom()), QPointF(mx,r.bottom()));
+    p.drawLine(QPointF(mx-r.width()*.25,r.bottom()),
+               QPointF(mx+r.width()*.25,r.bottom()));
     p.restore();
 }
 
@@ -194,7 +266,198 @@ static void drawGearIcon(QPainter &p, QRectF r, QColor c)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  ContentCard  –  handles Movie, Series, and Music tiles
+//  HeroCard  –  full-width featured banner on the Home page
+//
+//  Displays a large 16:9 image (or gradient placeholder) with a left-side
+//  text panel: title, meta line, description, and a subtle play hint.
+//  Focusable and confirmable just like ContentCard.
+// ─────────────────────────────────────────────────────────────────────────────
+class HeroCard : public QWidget
+{
+    ContentItem m_data;
+    bool        m_focused = false;
+    QPixmap     m_bg;
+
+    std::function<void(HeroCard *)> m_focusCb;
+    std::function<void(HeroCard *)> m_confirmCb;
+
+public:
+    HeroCard(const ContentItem &data, QWidget *parent = nullptr)
+        : QWidget(parent), m_data(data)
+    {
+        setFocusPolicy(Qt::StrongFocus);
+        setCursor(Qt::PointingHandCursor);
+        // Width is set by the parent layout; height is fixed.
+        setFixedHeight(TV::HERO_H);
+    }
+
+    void setFocusCb  (std::function<void(HeroCard *)> cb) { m_focusCb   = cb; }
+    void setConfirmCb(std::function<void(HeroCard *)> cb) { m_confirmCb = cb; }
+    const ContentItem &item() const { return m_data; }
+
+protected:
+    void resizeEvent(QResizeEvent *e) override
+    {
+        QWidget::resizeEvent(e);
+        buildBg();   // re-render when width is known / changes
+    }
+
+private:
+    void buildBg()
+    {
+        int w = width(), h = height();
+        if (w <= 0 || h <= 0) return;
+
+        m_bg = QPixmap(w, h);
+        m_bg.fill(Qt::transparent);
+        QPainter p(&m_bg);
+        p.setRenderHints(QPainter::Antialiasing | QPainter::SmoothPixmapTransform);
+
+        // Rounded clip
+        QPainterPath clip;
+        clip.addRoundedRect(0, 0, w, h, TV::HERO_R, TV::HERO_R);
+        p.setClipPath(clip);
+
+        // Background image or gradient
+        if (!m_data.imagePath.isEmpty() && QFile::exists(m_data.imagePath)) {
+            QPixmap src(m_data.imagePath);
+            src = src.scaled(w, h, Qt::KeepAspectRatioByExpanding,
+                             Qt::SmoothTransformation);
+            p.drawPixmap(-(src.width()-w)/2, -(src.height()-h)/2, src);
+        } else {
+            int hue = m_data.title.isEmpty() ? 220
+                    : qAbs(m_data.title[0].unicode()*53+190)%360;
+            QLinearGradient g(0, 0, w, h);
+            g.setColorAt(0, QColor::fromHsv(hue,          130, 58));
+            g.setColorAt(1, QColor::fromHsv((hue+50)%360, 100, 22));
+            p.fillRect(0, 0, w, h, g);
+        }
+
+        // Left-side text scrim: opaque on left, transparent by 55% width
+        QLinearGradient scrim(0, 0, w*.58, 0);
+        scrim.setColorAt(0.0, QColor(0, 0, 0, 230));
+        scrim.setColorAt(0.6, QColor(0, 0, 0, 160));
+        scrim.setColorAt(1.0, QColor(0, 0, 0,   0));
+        p.fillRect(0, 0, w, h, scrim);
+
+        // Bottom scrim
+        QLinearGradient bot(0, h-80, 0, h);
+        bot.setColorAt(0, QColor(0,0,0,0));
+        bot.setColorAt(1, QColor(0,0,0,120));
+        p.fillRect(0, h-80, w, 80, bot);
+
+        p.end();
+        update();
+    }
+
+protected:
+    void paintEvent(QPaintEvent *) override
+    {
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing);
+
+        // Multi-layer glow when focused
+        if (m_focused) {
+            for (int i = 8; i >= 1; --i) {
+                QPainterPath gp;
+                gp.addRoundedRect(QRectF(i,i,width()-2*i,height()-2*i),
+                                  TV::HERO_R+2, TV::HERO_R+2);
+                p.setPen(QPen(QColor(168,199,250, 9*i), 2));
+                p.setBrush(Qt::NoBrush);
+                p.drawPath(gp);
+            }
+        }
+
+        // Background
+        if (!m_bg.isNull()) p.drawPixmap(0, 0, m_bg);
+
+        // ── Text panel ────────────────────────────────────────────────────
+        const int pad   = 48;
+        const int maxW  = int(width() * 0.46);
+        int ty          = height() / 2 - 80;
+
+        // "FEATURED" badge
+        p.setFont(QFont("Roboto", 10, QFont::Bold));
+        p.setPen(Qt::NoPen);
+        p.setBrush(TV::FOCUS_CLR);
+        QRect badge(pad, ty, 90, 22);
+        p.drawRoundedRect(badge, 4, 4);
+        p.setPen(QColor(10,10,10));
+        p.drawText(badge, Qt::AlignCenter, "FEATURED");
+        ty += 32;
+
+        // Title
+        QFont titleFont("Roboto", 32, QFont::Bold);
+        p.setFont(titleFont);
+        p.setPen(TV::TEXT_PRI);
+        QRect titleR(pad, ty, maxW, 80);
+        p.drawText(titleR, Qt::AlignLeft | Qt::AlignTop | Qt::TextWordWrap,
+                   m_data.title);
+        QFontMetrics tfm(titleFont);
+        int titleLines = (tfm.boundingRect(titleR, Qt::TextWordWrap,
+                                           m_data.title).height() + tfm.height()-1)
+                         / tfm.height();
+        ty += qMin(titleLines, 2) * tfm.height() + 10;
+
+        // Meta
+        p.setFont(QFont("Roboto", 13));
+        p.setPen(TV::TEXT_SEC);
+        p.drawText(QRect(pad, ty, maxW, 22),
+                   Qt::AlignLeft | Qt::AlignVCenter, m_data.meta);
+        ty += 30;
+
+        // Description (up to 3 lines)
+        if (!m_data.description.isEmpty()) {
+            p.setFont(QFont("Roboto", 13));
+            p.setPen(QColor(200, 200, 200));
+            p.drawText(QRect(pad, ty, maxW, 66),
+                       Qt::AlignLeft | Qt::AlignTop | Qt::TextWordWrap,
+                       m_data.description);
+            ty += 76;
+        }
+
+        // Play hint
+        p.setFont(QFont("Roboto", 12, QFont::Medium));
+        p.setPen(m_focused ? TV::FOCUS_CLR : QColor(140,140,140));
+        p.drawText(QRect(pad, ty, maxW, 22),
+                   Qt::AlignLeft | Qt::AlignVCenter,
+                   m_focused ? "Press Enter to Play" : "Select to Play");
+
+        // Focus border
+        if (m_focused) {
+            QPainterPath bp;
+            bp.addRoundedRect(QRectF(1.5,1.5,width()-3,height()-3),
+                              TV::HERO_R, TV::HERO_R);
+            p.setPen(QPen(TV::FOCUS_CLR, 3));
+            p.setBrush(Qt::NoBrush);
+            p.drawPath(bp);
+        }
+    }
+
+    void focusInEvent(QFocusEvent *e) override
+    {
+        m_focused = true;  update();
+        if (m_focusCb) m_focusCb(this);
+        QWidget::focusInEvent(e);
+    }
+    void focusOutEvent(QFocusEvent *e) override
+    {
+        m_focused = false; update();
+        QWidget::focusOutEvent(e);
+    }
+
+    void keyPressEvent(QKeyEvent *e) override { e->ignore(); }
+
+    void mousePressEvent(QMouseEvent *e) override
+    {
+        setFocus();
+        if (m_confirmCb) m_confirmCb(this);
+        QWidget::mousePressEvent(e);
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ContentCard  –  standard 16:9 and square music tiles
 // ─────────────────────────────────────────────────────────────────────────────
 class ContentCard : public QWidget
 {
@@ -224,7 +487,6 @@ public:
     const ContentItem &item() const { return m_data; }
 
 private:
-    // Pre-render the static thumbnail once.
     void buildThumb()
     {
         int w = width(), h = height();
@@ -233,12 +495,10 @@ private:
         QPainter p(&m_thumb);
         p.setRenderHints(QPainter::Antialiasing | QPainter::SmoothPixmapTransform);
 
-        // Rounded clip
         QPainterPath clip;
         clip.addRoundedRect(0, 0, w, h, TV::CARD_R, TV::CARD_R);
         p.setClipPath(clip);
 
-        // Image or gradient placeholder
         bool imgOk = false;
         if (!m_data.imagePath.isEmpty() && QFile::exists(m_data.imagePath)) {
             QPixmap src(m_data.imagePath);
@@ -259,32 +519,28 @@ private:
             p.drawText(QRect(0,-12,w,h), Qt::AlignCenter, m_data.title.left(1));
         }
 
-        // Bottom scrim
         int scrimH = m_music ? 55 : 82;
         QLinearGradient scrim(0, h-scrimH, 0, h);
         scrim.setColorAt(0, QColor(0,0,0,0));
         scrim.setColorAt(1, QColor(0,0,0, m_music ? 195 : 232));
         p.fillRect(0, h-scrimH, w, scrimH, scrim);
 
-        // Title text
         QFont tf("Roboto", m_music ? 11 : 13, QFont::Bold);
         p.setFont(tf);
         p.setPen(TV::TEXT_PRI);
         QString el = QFontMetrics(tf).elidedText(m_data.title,Qt::ElideRight,w-20);
         p.drawText(QRect(10, h-(m_music?28:52), w-20, 22),
-                   Qt::AlignLeft | Qt::AlignVCenter, el);
+                   Qt::AlignLeft|Qt::AlignVCenter, el);
 
-        // Meta line (video cards only)
         if (!m_music) {
             p.setFont(QFont("Roboto", 10));
             p.setPen(TV::TEXT_SEC);
             p.drawText(QRect(10, h-28, w-20, 20),
-                       Qt::AlignLeft | Qt::AlignVCenter, m_data.meta);
+                       Qt::AlignLeft|Qt::AlignVCenter, m_data.meta);
         }
         p.end();
     }
 
-    // Overlaid on music card when focused: dim + white circle + play triangle
     void paintPlayOverlay(QPainter &p)
     {
         QPainterPath clip;
@@ -313,7 +569,6 @@ protected:
         QPainter p(this);
         p.setRenderHint(QPainter::Antialiasing);
 
-        // Multi-layer glow halo
         if (m_focused) {
             for (int i = 7; i >= 1; --i) {
                 QPainterPath gp;
@@ -327,11 +582,8 @@ protected:
 
         p.drawPixmap(0, 0, m_thumb);
 
-        // Music: play button overlay when focused
-        if (m_focused && m_music)
-            paintPlayOverlay(p);
+        if (m_focused && m_music) paintPlayOverlay(p);
 
-        // Focus border
         if (m_focused) {
             p.setBrush(Qt::NoBrush);
             QPainterPath bp;
@@ -354,7 +606,6 @@ protected:
         QWidget::focusOutEvent(e);
     }
 
-    // Key handling delegated entirely to DpadFilter → MainWindow::handleKey.
     void keyPressEvent(QKeyEvent *e) override { e->ignore(); }
 
     void mousePressEvent(QMouseEvent *e) override
@@ -366,19 +617,18 @@ protected:
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  SidebarOverlay  –  left panel, always full-height, shown/hidden on demand
+//  SidebarOverlay  –  now includes Home at the top
 // ─────────────────────────────────────────────────────────────────────────────
 class SidebarOverlay : public QWidget
 {
     struct NavItem { QString label; Category cat; };
     QVector<NavItem> m_items;
     int              m_sel    = 0;
-    Category         m_active = Category::Movies;
+    Category         m_active = Category::Home;
 
     std::function<void(Category)> m_selectCb;
     std::function<void()>         m_closeCb;
 
-    // Layout constants
     enum { ITEM_H=60, ITEM_Y0=210, ITEM_GAP=8,
            ICON_CX=56, ICON_SZ=24, LABEL_X=88 };
 
@@ -387,10 +637,11 @@ public:
     {
         setAttribute(Qt::WA_TranslucentBackground);
         setFixedWidth(TV::SIDEBAR_W);
-        m_items = { {"Search", Category::Search},
-                    {"Movies", Category::Movies},
-                    {"Series", Category::Series},
-                    {"Music",  Category::Music } };
+        m_items = { {"Home",   Category::Home  },
+                    {"Search", Category::Search },
+                    {"Movies", Category::Movies },
+                    {"Series", Category::Series },
+                    {"Music",  Category::Music  } };
     }
 
     void setSelectCb(std::function<void(Category)> cb) { m_selectCb = cb; }
@@ -415,12 +666,11 @@ protected:
         QPainter p(this);
         p.setRenderHints(QPainter::Antialiasing | QPainter::TextAntialiasing);
 
-        // Panel background
         p.setPen(Qt::NoPen);
         p.setBrush(QColor(16, 16, 20, 248));
         p.drawRect(rect());
 
-        // ── User avatar + name ────────────────────────────────────────────
+        // Avatar
         QRectF av(TV::MARGIN_V, 46, 52, 52);
         p.setBrush(QColor(110, 75, 195));
         p.drawEllipse(av);
@@ -440,11 +690,10 @@ protected:
                          width()-int(av.right())-18, 22),
                    Qt::AlignLeft|Qt::AlignVCenter, "Switch account");
 
-        // Divider
         p.setPen(QColor(255,255,255,20));
         p.drawLine(24, 130, width()-24, 130);
 
-        // ── Nav items ─────────────────────────────────────────────────────
+        // Nav items
         for (int i = 0; i < m_items.size(); ++i) {
             bool sel    = (i == m_sel);
             bool active = (m_items[i].cat == m_active);
@@ -452,7 +701,6 @@ protected:
             QRect pill(18, ITEM_Y0 + i*(ITEM_H+ITEM_GAP),
                        width()-36, ITEM_H);
 
-            // Pill background
             p.setPen(Qt::NoPen);
             if (sel) {
                 p.setBrush(QColor(238,238,238));
@@ -462,19 +710,18 @@ protected:
                 p.drawRoundedRect(pill, pill.height()/2, pill.height()/2);
             }
 
-            // Icon
             QColor ic = sel ? QColor(30,30,30) : TV::TEXT_PRI;
             QRectF iconR(pill.left()+ICON_CX-ICON_SZ/2,
                          pill.center().y()-ICON_SZ/2,
                          ICON_SZ, ICON_SZ);
             switch (m_items[i].cat) {
+            case Category::Home:   drawHomeIcon  (p, iconR, ic); break;
             case Category::Search: drawSearchIcon(p, iconR, ic); break;
             case Category::Movies: drawMoviesIcon(p, iconR, ic); break;
             case Category::Series: drawSeriesIcon(p, iconR, ic); break;
             case Category::Music:  drawMusicIcon (p, iconR, ic); break;
             }
 
-            // Label
             p.setPen(ic);
             p.setFont(QFont("Roboto", 16, sel ? QFont::Bold : QFont::Normal));
             p.drawText(QRect(pill.left()+LABEL_X, pill.top(),
@@ -482,7 +729,7 @@ protected:
                        Qt::AlignLeft|Qt::AlignVCenter, m_items[i].label);
         }
 
-        // ── Settings entry at bottom ──────────────────────────────────────
+        // Settings gutter
         int sy  = height() - TV::MARGIN_V - ITEM_H;
         QRect sp(18, sy, width()-36, ITEM_H);
         QRectF gR(sp.left()+ICON_CX-ICON_SZ/2,
@@ -544,7 +791,6 @@ public:
     void confirm()
     {
         if (m_btnSel == 0) {
-            // Play
             if (!m_item.filePath.isEmpty() && QFile::exists(m_item.filePath))
                 QProcess::startDetached("mpv",
                     QStringList() << "--vo=gpu"
@@ -554,7 +800,6 @@ public:
                 qDebug() << "No media file for:" << m_item.title;
             if (m_closeCb) m_closeCb();
         } else {
-            // Favourites – stub
             qDebug() << "Toggle favourites:" << m_item.title;
         }
     }
@@ -590,14 +835,13 @@ private:
         p.end();
     }
 
-    // Total card height – must match paintEvent layout exactly.
     int cardH() const
     {
         int h = IMGH;
-        h += 16 + 38;   // gap + title row
-        h += 32;        // meta row
+        h += 16 + 38;
+        h += 32;
         if (!m_item.description.isEmpty()) h += 92;
-        h += (BTNH+10) + BTNH + BPAD;   // two buttons + bottom pad
+        h += (BTNH+10) + BTNH + BPAD;
         return h;
     }
 
@@ -607,31 +851,26 @@ protected:
         QPainter p(this);
         p.setRenderHint(QPainter::Antialiasing);
 
-        // Full-screen dim
         p.fillRect(rect(), QColor(0,0,0,158));
 
         const int dh = cardH();
         const int cx = (width()-DW)/2, cy = (height()-dh)/2;
         QRect card(cx, cy, DW, dh);
 
-        // Drop shadow
         for (int i = 10; i >= 1; --i) {
             QPainterPath sp;
             sp.addRoundedRect(card.adjusted(-i,-i,i,i+2), 18, 18);
             p.fillPath(sp, QColor(0,0,0,7));
         }
 
-        // Card body
         QPainterPath cardPath;
         cardPath.addRoundedRect(card, 16, 16);
         p.fillPath(cardPath, TV::SURFACE);
 
-        // Image (clipped to card top corners)
         p.setClipPath(cardPath);
         p.drawPixmap(cx, cy, m_thumb);
         p.setClipping(false);
 
-        // Soft fade from image into card surface
         QLinearGradient fade(0, cy+IMGH-60, 0, cy+IMGH);
         fade.setColorAt(0, QColor(TV::SURFACE.red(),TV::SURFACE.green(),
                                   TV::SURFACE.blue(), 0));
@@ -640,21 +879,18 @@ protected:
 
         int ty = cy + IMGH + 16;
 
-        // Title
         p.setFont(QFont("Roboto", 21, QFont::Bold));
         p.setPen(TV::TEXT_PRI);
         p.drawText(QRect(cx+BPAD, ty, DW-BPAD*2, 32),
                    Qt::AlignLeft|Qt::AlignVCenter, m_item.title);
         ty += 38;
 
-        // Meta
         p.setFont(QFont("Roboto", 13));
         p.setPen(TV::TEXT_SEC);
         p.drawText(QRect(cx+BPAD, ty, DW-BPAD*2, 22),
                    Qt::AlignLeft|Qt::AlignVCenter, m_item.meta);
         ty += 32;
 
-        // Description
         if (!m_item.description.isEmpty()) {
             p.setFont(QFont("Roboto", 13));
             p.setPen(QColor(185,185,185));
@@ -664,7 +900,6 @@ protected:
             ty += 92;
         }
 
-        // ── Buttons ───────────────────────────────────────────────────────
         auto drawBtn = [&](int idx, const QString &label, bool primary) {
             bool sel = (m_btnSel == idx);
             QRect r(cx+BPAD, ty, DW-BPAD*2, BTNH);
@@ -677,7 +912,6 @@ protected:
                 p.setBrush(sel ? QColor(55,55,65) : QColor(36,36,46));
             p.drawRoundedRect(r, BTNH/2, BTNH/2);
 
-            // Secondary outline
             if (!primary) {
                 p.setPen(QPen(QColor(85,85,96), 1.5));
                 p.setBrush(Qt::NoBrush);
@@ -685,7 +919,6 @@ protected:
                 p.setPen(Qt::NoPen);
             }
 
-            // Play triangle on primary button
             if (primary) {
                 QPolygon tri;
                 int ax = r.center().x()-44, ay = r.center().y();
@@ -698,7 +931,6 @@ protected:
             p.setPen(primary ? QColor(15,15,15) : TV::TEXT_PRI);
             p.drawText(r, Qt::AlignCenter, label);
 
-            // Focus ring
             if (sel) {
                 p.setPen(QPen(TV::FOCUS_CLR, 2));
                 p.setBrush(Qt::NoBrush);
@@ -728,16 +960,18 @@ protected:
 // ─────────────────────────────────────────────────────────────────────────────
 struct CardRow {
     QVector<ContentCard *> cards;
-    QScrollArea           *hScroll = nullptr;
+    QScrollArea           *hScroll   = nullptr;
+    HeroCard              *heroCard  = nullptr;   // non-null only for the hero row
+    bool                   isHero    = false;
 };
 
-// Forward declaration required by GamepadReader.
 class MainWindow;
 
 class MainWindow : public QWidget
 {
+    // Start on Home; B button always returns here.
     AppState         m_state    = AppState::Browse;
-    Category         m_category = Category::Movies;
+    Category         m_category = Category::Home;
 
     QVector<CardRow> m_rows;
     int              m_r = 0, m_c = 0;
@@ -749,13 +983,13 @@ class MainWindow : public QWidget
     SidebarOverlay  *m_sidebar   = nullptr;
     DetailOverlay   *m_detail    = nullptr;
 
-    QGraphicsOpacityEffect *m_sidebarOpacity = nullptr;
-    QPropertyAnimation     *m_sidebarSlide   = nullptr;
-    QPropertyAnimation     *m_sidebarFade    = nullptr;
-    QParallelAnimationGroup *m_sidebarAnim   = nullptr;
+    QGraphicsOpacityEffect  *m_sidebarOpacity = nullptr;
+    QPropertyAnimation      *m_sidebarSlide   = nullptr;
+    QPropertyAnimation      *m_sidebarFade    = nullptr;
+    QParallelAnimationGroup *m_sidebarAnim    = nullptr;
 
     bool m_switchingCategory = false;
-    bool m_sidebarClosing = false;
+    bool m_sidebarClosing    = false;
 
 public:
     explicit MainWindow(QWidget *parent = nullptr) : QWidget(parent)
@@ -764,7 +998,6 @@ public:
         setStyleSheet(QString("QWidget { background-color: %1; }")
                       .arg(TV::BG.name()));
 
-        // Create overlays first (resizeEvent may fire during buildShell)
         m_sidebar = new SidebarOverlay(this);
         m_sidebar->hide();
         m_sidebarOpacity = new QGraphicsOpacityEffect(m_sidebar);
@@ -795,13 +1028,21 @@ public:
         m_detail->setCloseCb([this](){ closeDetail(); });
 
         buildShell();
-        switchCategory(Category::Movies);
+        // Launch on Home page
+        switchCategory(Category::Home);
     }
 
     void setInitialFocus()
     {
-        if (!m_rows.isEmpty() && !m_rows[0].cards.isEmpty())
+        if (m_rows.isEmpty()) return;
+        // Prefer the hero card when on the home page
+        if (m_rows[0].isHero && m_rows[0].heroCard) {
+            m_rows[0].heroCard->setFocus();
+            m_r = 0; m_c = 0;
+        } else if (!m_rows[0].cards.isEmpty()) {
             m_rows[0].cards[0]->setFocus();
+            m_r = 0; m_c = 0;
+        }
     }
 
     AppState appState() const { return m_state; }
@@ -870,7 +1111,14 @@ public:
         restoreFocus();
     }
 
-    // ── Central key-dispatch (called by DpadFilter and GamepadReader) ─────
+    // ── Go to Home (B button / back action in Browse mode) ────────────────
+    void goHome()
+    {
+        if (m_category == Category::Home) return;  // already home – no-op
+        switchCategory(Category::Home);
+    }
+
+    // ── Central key-dispatch ──────────────────────────────────────────────
     void handleKey(int key)
     {
         switch (m_state) {
@@ -879,7 +1127,9 @@ public:
             case Qt::Key_Up:                         m_sidebar->moveUp();   break;
             case Qt::Key_Down:                       m_sidebar->moveDown(); break;
             case Qt::Key_Return: case Qt::Key_Enter: m_sidebar->confirm();  break;
-            case Qt::Key_Escape: case Qt::Key_Left:  closeSidebar();        break;
+            // Left or Back/Escape closes sidebar; does NOT go home from here
+            case Qt::Key_Escape: case Qt::Key_Back:
+            case Qt::Key_Left:                       closeSidebar();        break;
             default: break;
             }
             break;
@@ -889,7 +1139,8 @@ public:
             case Qt::Key_Up:                         m_detail->moveUp();   break;
             case Qt::Key_Down:                       m_detail->moveDown(); break;
             case Qt::Key_Return: case Qt::Key_Enter: m_detail->confirm();  break;
-            case Qt::Key_Escape:                     closeDetail();        break;
+            // Back / B from detail → dismiss overlay only (stay on current page)
+            case Qt::Key_Escape: case Qt::Key_Back:  closeDetail();        break;
             default: break;
             }
             break;
@@ -902,24 +1153,33 @@ public:
             case Qt::Key_Down:   navigate( 1, 0); break;
             case Qt::Key_Return:
             case Qt::Key_Enter:
-                if (!m_rows.isEmpty() && m_r < m_rows.size()
-                        && m_c < m_rows[m_r].cards.size())
-                    onCardConfirmed(m_rows[m_r].cards[m_c]);
-                break;
-            case Qt::Key_Escape: close(); break;
+                confirmFocused(); break;
+            // Back / Escape / B button → go to Home (never close the app)
+            case Qt::Key_Escape: case Qt::Key_Back:
+                goHome(); break;
             default: break;
             }
             break;
         }
     }
 
-    // ── Called by GamepadReader (A button) ────────────────────────────────
     void activateFocused() { handleKey(Qt::Key_Return); }
 
     void navigate(int dr, int dc)
     {
         if (m_rows.isEmpty()) return;
+
         int nr = qBound(0, m_r+dr, m_rows.size()-1);
+
+        // Hero row occupies "column 0" conceptually; it has no siblings.
+        // Moving down from it → jump to first card row.
+        // Moving up into it → hero card takes focus regardless of m_c.
+        if (m_rows[nr].isHero) {
+            m_r = nr; m_c = 0;
+            if (m_rows[nr].heroCard) m_rows[nr].heroCard->setFocus();
+            return;
+        }
+
         int nc = (dr != 0) ? qBound(0, m_c, m_rows[nr].cards.size()-1)
                            : qBound(0, m_c+dc, m_rows[nr].cards.size()-1);
         m_r = nr; m_c = nc;
@@ -941,11 +1201,17 @@ public:
                 if (m_rows[r].cards[c] == card) { m_r=r; m_c=c; return; }
     }
 
+    void onHeroFocused(HeroCard *hero)
+    {
+        if (m_infoTitle) m_infoTitle->setText(hero->item().title);
+        if (m_infoMeta)  m_infoMeta->setText(hero->item().meta);
+        m_r = 0; m_c = 0;
+    }
+
     void onCardConfirmed(ContentCard *card)
     {
         const ContentItem &item = card->item();
         if (item.kind == CardKind::Music) {
-            // Music: play immediately, no detail overlay.
             if (!item.filePath.isEmpty() && QFile::exists(item.filePath))
                 QProcess::startDetached("mpv",
                     QStringList() << "--vo=gpu"
@@ -954,22 +1220,45 @@ public:
             else
                 qDebug() << "No audio file:" << item.title;
         } else {
-            // Movie / Series: open the detail overlay.
             openDetail(item);
         }
     }
 
+    void onHeroConfirmed(HeroCard *hero)
+    {
+        openDetail(hero->item());
+    }
+
 private:
+    // Confirm whichever widget currently has focus (hero or card).
+    void confirmFocused()
+    {
+        if (m_rows.isEmpty()) return;
+        if (m_r >= m_rows.size()) return;
+
+        const CardRow &row = m_rows[m_r];
+        if (row.isHero && row.heroCard) {
+            onHeroConfirmed(row.heroCard);
+        } else if (m_c < row.cards.size()) {
+            onCardConfirmed(row.cards[m_c]);
+        }
+    }
+
     void restoreFocus()
     {
         if (m_rows.isEmpty()) return;
         m_r = qBound(0, m_r, m_rows.size()-1);
-        m_c = qBound(0, m_c, m_rows[m_r].cards.size()-1);
-        if (!m_rows[m_r].cards.isEmpty())
-            m_rows[m_r].cards[m_c]->setFocus();
+
+        const CardRow &row = m_rows[m_r];
+        if (row.isHero && row.heroCard) {
+            row.heroCard->setFocus();
+        } else if (!row.cards.isEmpty()) {
+            m_c = qBound(0, m_c, row.cards.size()-1);
+            row.cards[m_c]->setFocus();
+        }
     }
 
-    // ── Build fixed shell (header, info banner, scroll area) ─────────────
+    // ── Shell ─────────────────────────────────────────────────────────────
     void buildShell()
     {
         auto *root = new QVBoxLayout(this);
@@ -991,16 +1280,14 @@ private:
         hl->addWidget(m_header);
         hl->addStretch();
 
-        // Hint text (ASCII-safe, no Unicode arrows in this slot)
-        auto *hint = new QLabel(
-            "[Home] menu   [Arr] navigate   [Enter] select/play   [Esc] quit");
+        auto *hint = new QLabel("[Home] menu   [Arr] navigate   [Enter] play   [B] back");
         hint->setStyleSheet("color:#3A3A3A; font:13px 'Roboto';"
                             " background:transparent;");
         hl->addWidget(hint);
         root->addWidget(hdr);
         root->addSpacing(12);
 
-        // Info banner (shows currently focused item)
+        // Info banner
         auto *banner = new QWidget; banner->setStyleSheet("background:transparent;");
         banner->setFixedHeight(36);
         auto *bl = new QHBoxLayout(banner);
@@ -1027,7 +1314,7 @@ private:
         root->addWidget(m_vScroll);
     }
 
-    // ── Rebuild content rows for the chosen category ──────────────────────
+    // ── Category switch with slide-in animation ───────────────────────────
     void switchCategory(Category cat)
     {
         if (m_switchingCategory) return;
@@ -1037,7 +1324,7 @@ private:
         m_rows.clear();
         m_r = 0; m_c = 0;
 
-        static const char *labels[] = {"SEARCH","MOVIES","SERIES","MUSIC"};
+        static const char *labels[] = {"HOME","SEARCH","MOVIES","SERIES","MUSIC"};
         m_header->setText(labels[static_cast<int>(cat)]);
 
         auto *vc = new QWidget; vc->setStyleSheet("background:transparent;");
@@ -1045,6 +1332,7 @@ private:
         vl->setContentsMargins(0,0,0,0); vl->setSpacing(TV::ROW_GAP);
 
         switch (cat) {
+        case Category::Home:   buildHome  (vl); break;
         case Category::Search: buildSearch(vl); break;
         case Category::Movies: buildMovies(vl); break;
         case Category::Series: buildSeries(vl); break;
@@ -1052,6 +1340,7 @@ private:
         }
         vl->addStretch();
 
+        // Fade out old content
         QWidget *oldContent = m_vScroll->widget();
         if (oldContent) {
             auto *oldFx = new QGraphicsOpacityEffect(oldContent);
@@ -1069,22 +1358,19 @@ private:
         m_vScroll->takeWidget();
         m_vScroll->setWidget(vc);
 
+        // Slide + fade in new content
         auto *fx = new QGraphicsOpacityEffect(vc);
         vc->setGraphicsEffect(fx);
         fx->setOpacity(0.0);
         vc->move(36, 0);
 
         auto *slide = new QPropertyAnimation(vc, "pos", vc);
-        slide->setDuration(230);
-        slide->setEasingCurve(QEasingCurve::OutCubic);
-        slide->setStartValue(QPoint(36, 0));
-        slide->setEndValue(QPoint(0, 0));
+        slide->setDuration(230); slide->setEasingCurve(QEasingCurve::OutCubic);
+        slide->setStartValue(QPoint(36,0)); slide->setEndValue(QPoint(0,0));
 
         auto *fade = new QPropertyAnimation(fx, "opacity", vc);
-        fade->setDuration(230);
-        fade->setEasingCurve(QEasingCurve::OutCubic);
-        fade->setStartValue(0.0);
-        fade->setEndValue(1.0);
+        fade->setDuration(230); fade->setEasingCurve(QEasingCurve::OutCubic);
+        fade->setStartValue(0.0); fade->setEndValue(1.0);
 
         auto *group = new QParallelAnimationGroup(vc);
         group->addAnimation(slide);
@@ -1107,12 +1393,90 @@ private:
     }
 
     // ── Content builders ──────────────────────────────────────────────────
+
+    // Home page:  Hero banner  +  Frequently Played  +  Recently Watched
+    void buildHome(QVBoxLayout *vl)
+    {
+        using CI = ContentItem;
+
+        // ── Hero (featured item) ──────────────────────────────────────────
+        CI featured = {
+            CardKind::Movie, "galactic_quest.png", "GALACTIC QUEST",
+            "2024 \u00b7 2h 18m \u00b7 Sci-Fi",
+            "A rogue crew races across the galaxy to prevent an ancient "
+            "weapon from falling into the wrong hands.",
+            "/media/big_buck_bunny_1080p_surround.avi"
+        };
+
+        auto *heroW = new QWidget; heroW->setStyleSheet("background:transparent;");
+        auto *heroL = new QVBoxLayout(heroW);
+        heroL->setContentsMargins(0,0,0,0);
+
+        auto *hero = new HeroCard(featured, heroW);
+        hero->setFocusCb  ([this](HeroCard *h){ onHeroFocused(h);   });
+        hero->setConfirmCb([this](HeroCard *h){ onHeroConfirmed(h); });
+        heroL->addWidget(hero);
+
+        vl->addWidget(heroW);
+
+        CardRow heroRow;
+        heroRow.isHero   = true;
+        heroRow.heroCard = hero;
+        m_rows.append(heroRow);
+
+        // ── Frequently Played ─────────────────────────────────────────────
+        QVector<CI> frequent = {
+            {CardKind::Movie,"galactic_quest.png","GALACTIC QUEST",
+             "2024 \u00b7 2h 18m \u00b7 Sci-Fi",
+             "A rogue crew races across the galaxy to prevent an ancient "
+             "weapon from falling into the wrong hands.",
+             "/media/big_buck_bunny_1080p_surround.avi"},
+            {CardKind::Movie,"","NOVA RISING",
+             "2022 \u00b7 1h 28m \u00b7 Action",
+             "An unlikely hero must master ancient powers to stop a rising "
+             "empire from plunging the world into chaos.",""},
+            {CardKind::Series,"","STELLAR DRIFT",
+             "S1 \u00b7 8 Episodes \u00b7 Action",
+             "A smuggler and a soldier forge an unlikely alliance against "
+             "a collapsing interstellar empire.",""},
+            {CardKind::Movie,"","DEEP HORIZON",
+             "2024 \u00b7 1h 8m \u00b7 Drama",
+             "Beneath three miles of ocean, researchers discover something "
+             "that was never meant to be found.",""},
+            {CardKind::Series,"","ECHO CHAMBER",
+             "S3 \u00b7 12 Episodes \u00b7 Sci-Fi",
+             "A whistleblower wakes in a simulation \u2014 and suspects "
+             "she\u2019s not the only one trapped inside.",""},
+            {CardKind::Movie,"","IRON MERIDIAN",
+             "2024 \u00b7 2h 2m \u00b7 Action",
+             "An ex-special-forces operative goes rogue to dismantle a "
+             "weapons network spanning three continents.",""},
+        };
+        addRow(vl, "Frequently Played", frequent);
+
+        // ── Recently Watched ──────────────────────────────────────────────
+        QVector<CI> recent = {
+            {CardKind::Movie,"","JOURNEY TO MARS",
+             "2023 \u00b7 1h 54m \u00b7 Drama",
+             "An astronaut\u2019s solo mission to Mars forces her to confront "
+             "isolation, fear, and what it means to be human.",""},
+            {CardKind::Movie,"","THE VOID",
+             "2024 \u00b7 52m \u00b7 Documentary",
+             "A deep-dive into the mysteries of black holes.",""},
+            {CardKind::Series,"","DARK ARCHIVE",
+             "S2 \u00b7 10 Episodes \u00b7 Thriller",
+             "An archivist stumbles on classified files that rewrite "
+             "everything she thought she knew about her city.",""},
+            {CardKind::Movie,"","BLUE FREQUENCY",
+             "2023 \u00b7 1h 30m \u00b7 Sci-Fi",
+             "A radio engineer picks up a signal from 1977 \u2014 and the "
+             "voice on the other end knows her name.",""},
+        };
+        addRow(vl, "Recently Watched", recent);
+    }
+
     void buildSearch(QVBoxLayout *vl)
     {
-        // NOTE: DpadFilter does NOT intercept regular character keys, so
-        // typing works normally in the QLineEdit.  Arrow keys for cursor
-        // movement inside the field ARE intercepted; this is an acceptable
-        // trade-off for a TV remote interface.
         auto *bar = new QLineEdit;
         bar->setPlaceholderText("Search movies, series, music\u2026");
         bar->setStyleSheet(QString(
@@ -1242,7 +1606,7 @@ private:
         addRow(vl, "Recently Played", recent);
     }
 
-    // ── Build one horizontal card row ─────────────────────────────────────
+    // ── Build one horizontal card row (no hero) ───────────────────────────
     void addRow(QVBoxLayout *parent, const QString &title,
                 const QVector<ContentItem> &items)
     {
@@ -1252,7 +1616,6 @@ private:
         auto *rl   = new QVBoxLayout(rowW);
         rl->setContentsMargins(0,0,0,0); rl->setSpacing(10);
 
-        // Row heading
         auto *lbl = new QLabel(title);
         lbl->setStyleSheet(QString(
             "color:%1; font:bold 14px 'Roboto';"
@@ -1260,7 +1623,6 @@ private:
             .arg(TV::TEXT_PRI.name()));
         rl->addWidget(lbl);
 
-        // Horizontal scroll area
         auto *hs = new QScrollArea;
         hs->setFrameShape(QFrame::NoFrame);
         hs->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
@@ -1293,20 +1655,20 @@ protected:
     void resizeEvent(QResizeEvent *e) override
     {
         QWidget::resizeEvent(e);
-        // Keep overlays pinned to window edges.
         if (m_sidebar) m_sidebar->setGeometry(0, 0, TV::SIDEBAR_W, height());
         if (m_detail)  m_detail->setGeometry(0, 0, width(), height());
     }
 
+    // MainWindow itself handles no keys directly – everything goes through
+    // DpadFilter → handleKey.  We intentionally do NOT call close() anywhere.
     void keyPressEvent(QKeyEvent *e) override
     {
-        if (e->key() == Qt::Key_Escape) close();
-        else QWidget::keyPressEvent(e);
+        QWidget::keyPressEvent(e);   // let DpadFilter handle it
     }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  DpadFilter  –  intercepts navigation keys app-wide and routes via state
+//  DpadFilter  –  routes navigation keys through the state machine
 // ─────────────────────────────────────────────────────────────────────────────
 class DpadFilter : public QObject
 {
@@ -1320,7 +1682,7 @@ public:
         if (ev->type() != QEvent::KeyPress) return false;
         auto *ke = static_cast<QKeyEvent *>(ev);
 
-        // BTN_START (Linux evdev keycode 314) or Qt::Key_Home → sidebar toggle
+        // BTN_START / Qt::Key_Home → sidebar toggle
         const bool isStart = (ke->key() == Qt::Key_Home)
                           || (ke->nativeScanCode() == 314u);
         if (isStart) {
@@ -1329,22 +1691,22 @@ public:
             return true;
         }
 
-        // Route all navigation & confirm/back keys through the state machine.
         switch (ke->key()) {
         case Qt::Key_Left:   case Qt::Key_Right:
         case Qt::Key_Up:     case Qt::Key_Down:
         case Qt::Key_Return: case Qt::Key_Enter:
+        // Escape and Back are now "go home", NOT "quit" – handled in handleKey
         case Qt::Key_Escape: case Qt::Key_Back:
             m_win->handleKey(ke->key());
-            return true;    // consumed – prevents scroll areas from eating arrows
+            return true;
         default:
-            return false;   // let other keys (typing) reach their target widget
+            return false;
         }
     }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  GamepadReader  –  evdev Xbox controller  (unchanged logic from v1)
+//  GamepadReader  –  evdev Xbox controller
 // ─────────────────────────────────────────────────────────────────────────────
 class GamepadReader : public QObject
 {
@@ -1358,6 +1720,10 @@ public:
                   QObject *parent = nullptr)
         : QObject(parent), m_win(win)
     {
+        if (devPath.isEmpty()) {
+            qWarning() << "GamepadReader: no device path – controller disabled.";
+            return;
+        }
         m_fd = ::open(devPath.toLocal8Bit().constData(),
                       O_RDONLY | O_NONBLOCK);
         if (m_fd < 0) {
@@ -1386,13 +1752,11 @@ private slots:
                 else if (ev.code == ABS_HAT0Y && ev.value ==  1) m_win->handleKey(Qt::Key_Down);
             } else if (ev.type == EV_KEY && ev.value == 1) {
                 switch (ev.code) {
-                case BTN_SOUTH:  m_win->activateFocused(); break;  // A → play
-                case BTN_EAST:   m_win->handleKey(Qt::Key_Escape); break; // B → back
-                case BTN_START:                                    // Start → sidebar
-                    if (m_win->appState() == AppState::Browse)
-                        m_win->openSidebar();
-                    else if (m_win->appState() == AppState::Sidebar)
-                        m_win->closeSidebar();
+                case BTN_SOUTH:  m_win->activateFocused();            break; // A → play/confirm
+                case BTN_EAST:   m_win->handleKey(Qt::Key_Back);      break; // B → go home
+                case BTN_START:
+                    if      (m_win->appState() == AppState::Browse)  m_win->openSidebar();
+                    else if (m_win->appState() == AppState::Sidebar) m_win->closeSidebar();
                     break;
                 default: break;
                 }
@@ -1408,7 +1772,6 @@ int main(int argc, char *argv[])
 {
     QApplication app(argc, argv);
 
-    // Load bundled Roboto from Qt resources.
     const QStringList fontFiles = {
         ":/fonts/Roboto-Light.ttf",
         ":/fonts/Roboto-Regular.ttf",
@@ -1423,16 +1786,16 @@ int main(int argc, char *argv[])
 
     MainWindow win;
 
-    // Keyboard / TV-remote arrow-key filter
     DpadFilter kbDpad(&win);
     app.installEventFilter(&kbDpad);
 
-    // Xbox controller via evdev.
-    // Pass alternate path on command line if the device index differs:
+    // Xbox controller auto-detection.
+    // Pass an explicit path on the command line to override auto-detection:
     //   ./myqtapp /dev/input/event3
     const QString gamepadPath = (argc > 1)
         ? QString::fromLocal8Bit(argv[1])
-        : QStringLiteral("/dev/input/event2");
+        : findXboxEventDevice();
+
     GamepadReader gamepad(gamepadPath, &win);
 
     win.showFullScreen();
@@ -1441,5 +1804,4 @@ int main(int argc, char *argv[])
     return app.exec();
 }
 
-// Required because GamepadReader carries Q_OBJECT and lives in a .cpp file.
 #include "myQtApp.moc"
